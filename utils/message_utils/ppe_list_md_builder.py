@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclass import PlayerData
-from utils.ppe_types import normalize_ppe_type, ppe_type_short_label
+from utils.ppe_types import normalize_ppe_type, ppe_type_compact_summary
 from utils.message_utils.markdown_message_builder import MarkdownMessageBuilder
+from utils.points_service import compute_effective_ppe_points
 from utils.points_service import non_default_points_adjustment_lines
 
 
@@ -16,12 +17,30 @@ def _format_points(value: float) -> str:
 
 
 def _display_class_name(ppe) -> str:
-    return str(getattr(ppe.name, "value", ppe.name))
+    return _inline_code(str(getattr(ppe.name, "value", ppe.name)))
 
 
-def _display_ppe_type(ppe) -> str:
+def _display_ppe_type(ppe, *, guild_config: dict | None = None) -> str:
     normalized = normalize_ppe_type(getattr(ppe, "ppe_type", None))
-    return ppe_type_short_label(normalized)
+    options = getattr(ppe, "ppe_type_options", None)
+    ppe_settings = {}
+    if isinstance(guild_config, dict):
+        raw_settings = guild_config.get("ppe_settings", {})
+        if isinstance(raw_settings, dict):
+            ppe_settings = raw_settings
+    summary = ppe_type_compact_summary(options, fallback_type=normalized, ppe_settings=ppe_settings)
+    return _inline_code(summary)
+
+
+def _inline_code(text: str) -> str:
+    value = str(text).replace("`", "\\`")
+    return f"`{value}`"
+
+
+def _effective_points(ppe, *, guild_config: dict | None = None) -> float:
+    if not isinstance(guild_config, dict):
+        return float(getattr(ppe, "points", 0.0) or 0.0)
+    return float(compute_effective_ppe_points(ppe, guild_config=guild_config))
 
 
 def create_ppe_list_markdown_file(
@@ -32,7 +51,15 @@ def create_ppe_list_markdown_file(
     guild_config: dict | None = None,
 ) -> str:
     sorted_ppes = sorted(player_data.ppes, key=lambda p: int(p.id))
-    best_ppe = max(sorted_ppes, key=lambda p: float(p.points), default=None)
+    effective_points_by_id = {
+        int(ppe.id): _effective_points(ppe, guild_config=guild_config)
+        for ppe in sorted_ppes
+    }
+    best_ppe = max(
+        sorted_ppes,
+        key=lambda p: effective_points_by_id.get(int(p.id), 0.0),
+        default=None,
+    )
     best_ppe_id = int(best_ppe.id) if best_ppe else None
 
     builder = MarkdownMessageBuilder(f"PPE List for {display_name}")
@@ -55,9 +82,10 @@ def create_ppe_list_markdown_file(
                 labels.append("BEST")
 
             suffix = f" [{' | '.join(labels)}]" if labels else ""
+            effective_points = effective_points_by_id.get(int(ppe.id), float(getattr(ppe, "points", 0.0) or 0.0))
             lines.append(
-                f"PPE #{ppe.id} | Class: {_display_class_name(ppe)} | Type: {_display_ppe_type(ppe)} "
-                f"| Points: {_format_points(ppe.points)}{suffix}"
+                f"PPE #{ppe.id} | Class: {_display_class_name(ppe)} | Type: {_display_ppe_type(ppe, guild_config=guild_config)} "
+                f"| Points: {_format_points(effective_points)}{suffix}"
             )
 
         builder.add_numbered_list(lines, heading="Characters")

@@ -9,9 +9,10 @@ import discord
 from menus.leaderboard.common import send_error_response
 from menus.leaderboard.services import member_display_name, require_guild
 from utils.calc_points import normalize_item_name
-from utils.guild_config import get_quest_points
+from utils.guild_config import get_quest_points, load_guild_config
+from utils.points_service import compute_effective_ppe_points
 from utils.player_records import load_player_records
-from utils.ppe_types import ppe_type_short_label
+from utils.ppe_types import normalize_ppe_type, ppe_type_compact_summary
 from utils.season_loot_history import season_unique_items
 
 _LOOT_CSV_PATH = Path("rotmg_loot_drops_updated.csv")
@@ -54,6 +55,8 @@ async def command(interaction: discord.Interaction) -> None:
 
     try:
         records = await load_player_records(interaction)
+        guild_config = await load_guild_config(interaction)
+        ppe_settings = guild_config.get("ppe_settings", {}) if isinstance(guild_config.get("ppe_settings", {}), dict) else {}
         regular_points, shiny_points, skin_points = await get_quest_points(interaction)
         item_to_dungeon = _load_item_to_dungeon()
 
@@ -87,7 +90,7 @@ async def command(interaction: discord.Interaction) -> None:
             quest_data = getattr(data, "quests", None)
 
             display_name = member_display_name(guild, user_id)
-            player_points = sum(float(getattr(ppe, "points", 0.0) or 0.0) for ppe in ppes)
+            player_points = sum(compute_effective_ppe_points(ppe, guild_config=guild_config) for ppe in ppes)
             player_character_count = len(ppes)
             player_unique_season = len(season_unique_items(data))
 
@@ -110,8 +113,13 @@ async def command(interaction: discord.Interaction) -> None:
                 class_counts[class_name] += 1
                 player_classes[class_name] += 1
 
-                ppe_type = str(getattr(ppe, "ppe_type", "") or "")
-                ppe_type_counts[ppe_type_short_label(ppe_type)] += 1
+                ppe_type_counts[
+                    ppe_type_compact_summary(
+                        getattr(ppe, "ppe_type_options", None),
+                        fallback_type=normalize_ppe_type(getattr(ppe, "ppe_type", None)),
+                        ppe_settings=ppe_settings,
+                    )
+                ] += 1
 
                 for loot in list(getattr(ppe, "loot", []) or []):
                     item_name = normalize_item_name(str(getattr(loot, "item_name", "")))

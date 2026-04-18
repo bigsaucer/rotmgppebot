@@ -8,7 +8,21 @@ from typing import Any
 
 import discord
 
-from utils.ppe_types import normalize_allowed_ppe_types, normalize_ppe_type_multipliers
+from utils.ppe_types import (
+    normalize_cleared_combo_signatures,
+    normalize_combo_signature,
+    normalize_iterative_combo_overrides,
+    normalize_allowed_ppe_types,
+    normalize_ppe_combo_label_overrides,
+    normalize_ppe_type,
+    normalize_ppe_type_label_overrides,
+    normalize_ppe_type_multipliers,
+    normalize_ppe_type_options,
+    normalize_ppe_type_short_label_overrides,
+    ppe_type_option_signature,
+    DEFAULT_PPE_TYPE_MULTIPLIERS,
+    DEFAULT_ITERATIVE_OPTION_MULTIPLIERS,
+)
 from utils.bot_cost_tracking import (
     ensure_guild_cost_log_file,
     clear_guild_cost_log,
@@ -29,6 +43,8 @@ from utils.guild_config import (
     set_ppe_settings,
     set_points_settings,
     set_realmshark_settings,
+    set_iterative_ppe_combo_override,
+    update_iterative_ppe_option_multipliers,
     update_global_points_modifiers,
     update_starting_penalty_modifiers,
 )
@@ -37,6 +53,7 @@ from utils.points_service import recompute_ppe_points
 from utils.sniffer_helpers.realmshark_pending_store import clear_all_pending_for_guild
 from utils.contest_leaderboards import normalize_contest_leaderboard_id
 from utils.sniffer_helpers.realmshark_cleanup import clear_ppe_character_links
+from utils.group_ppes import clear_all_group_ppes
 from utils.settings.channel_settings import (
     clear_item_suggestions_enabled_channels,
     set_item_suggestions_mode_enabled,
@@ -203,7 +220,26 @@ async def load_points_settings_for_menu(interaction: discord.Interaction) -> dic
 async def load_character_settings_for_menu(interaction: discord.Interaction) -> dict[str, Any]:
     """Load character settings for character-settings embeds/views."""
     settings = await get_ppe_settings(interaction)
-    return dict(settings)
+    hydrated = dict(settings)
+
+    observed_signatures: set[str] = set()
+    try:
+        records = await load_player_records(interaction)
+    except Exception:
+        records = {}
+
+    for player_data in records.values():
+        for ppe in getattr(player_data, "ppes", []):
+            options = normalize_ppe_type_options(
+                getattr(ppe, "ppe_type_options", None),
+                current_type=getattr(ppe, "ppe_type", None),
+            )
+            signature = normalize_combo_signature(ppe_type_option_signature(options))
+            if signature and signature != "regular":
+                observed_signatures.add(signature)
+
+    hydrated["observed_combo_signatures"] = sorted(observed_signatures)
+    return hydrated
 
 
 async def load_contest_settings_for_menu(interaction: discord.Interaction) -> dict[str, Any]:
@@ -527,6 +563,207 @@ async def update_ppe_type_multipliers(
     return dict(saved), refresh_summary
 
 
+async def update_iterative_base_option_multipliers(
+    interaction: discord.Interaction,
+    *,
+    multipliers: dict[str, Any],
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    saved = await update_iterative_ppe_option_multipliers(
+        interaction,
+        multipliers=multipliers,
+    )
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def set_iterative_combo_multiplier_override(
+    interaction: discord.Interaction,
+    *,
+    signature: str,
+    multiplier: float | None,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    saved = await set_iterative_ppe_combo_override(
+        interaction,
+        signature=signature,
+        multiplier=multiplier,
+    )
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def update_ppe_type_display_overrides(
+    interaction: discord.Interaction,
+    *,
+    label_overrides: dict[str, str] | None = None,
+    short_label_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    current_labels = normalize_ppe_type_label_overrides(settings.get("type_label_overrides"))
+    current_short = normalize_ppe_type_short_label_overrides(settings.get("type_short_label_overrides"))
+
+    if label_overrides is not None:
+        current_labels.update(normalize_ppe_type_label_overrides(label_overrides))
+    if short_label_overrides is not None:
+        current_short.update(normalize_ppe_type_short_label_overrides(short_label_overrides))
+
+    settings["type_label_overrides"] = current_labels
+    settings["type_short_label_overrides"] = current_short
+    saved = await set_ppe_settings(interaction, settings)
+    return dict(saved)
+
+
+async def clear_ppe_type_display_override(
+    interaction: discord.Interaction,
+    *,
+    ppe_type: str,
+) -> dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    normalized_type = normalize_ppe_type(ppe_type)
+    current_labels = normalize_ppe_type_label_overrides(settings.get("type_label_overrides"))
+    current_short = normalize_ppe_type_short_label_overrides(settings.get("type_short_label_overrides"))
+    current_labels.pop(normalized_type, None)
+    current_short.pop(normalized_type, None)
+    settings["type_label_overrides"] = current_labels
+    settings["type_short_label_overrides"] = current_short
+    saved = await set_ppe_settings(interaction, settings)
+    return dict(saved)
+
+
+async def set_combo_display_override(
+    interaction: discord.Interaction,
+    *,
+    signature: str,
+    name: str | None,
+    short: str | None,
+) -> dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    overrides = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
+    normalized_signature = normalize_combo_signature(signature)
+    if not normalized_signature:
+        raise ValueError("Signature is required.")
+
+    clean_name = str(name or "").strip()
+    clean_short = str(short or "").strip()
+    if not clean_name and not clean_short:
+        overrides.pop(normalized_signature, None)
+    else:
+        overrides[normalized_signature] = {"name": clean_name, "short": clean_short}
+
+    settings["combo_label_overrides"] = overrides
+    saved = await set_ppe_settings(interaction, settings)
+    return dict(saved)
+
+
+async def update_combo_multiplier_details(
+    interaction: discord.Interaction,
+    *,
+    signature: str,
+    multiplier: float | None,
+    name: str | None = None,
+    short: str | None = None,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    settings = await get_ppe_settings(interaction)
+
+    combo_overrides = normalize_iterative_combo_overrides(settings.get("iterative_combo_overrides"))
+    cleared_signatures = set(normalize_cleared_combo_signatures(settings.get("iterative_cleared_signatures")))
+    label_overrides = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
+
+    normalized_signature = normalize_combo_signature(signature)
+    if not normalized_signature:
+        raise ValueError("Signature is required.")
+
+    if multiplier is None:
+        combo_overrides.pop(normalized_signature, None)
+        cleared_signatures.add(normalized_signature)
+    else:
+        combo_overrides[normalized_signature] = float(multiplier)
+        cleared_signatures.discard(normalized_signature)
+
+    clean_name = str(name or "").strip()
+    clean_short = str(short or "").strip()
+    if not clean_name and not clean_short:
+        label_overrides.pop(normalized_signature, None)
+    else:
+        label_overrides[normalized_signature] = {"name": clean_name, "short": clean_short}
+
+    settings["iterative_combo_overrides"] = combo_overrides
+    settings["iterative_cleared_signatures"] = sorted(cleared_signatures)
+    settings["combo_label_overrides"] = label_overrides
+    saved = await set_ppe_settings(interaction, settings)
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def clear_all_ppe_type_overrides(
+    interaction: discord.Interaction,
+    *,
+    clear_type_labels: bool = True,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    settings = await get_ppe_settings(interaction)
+    settings["iterative_combo_overrides"] = normalize_iterative_combo_overrides({})
+    settings["iterative_cleared_signatures"] = normalize_cleared_combo_signatures([])
+    settings["combo_label_overrides"] = normalize_ppe_combo_label_overrides({})
+    if clear_type_labels:
+        settings["type_label_overrides"] = normalize_ppe_type_label_overrides({})
+        settings["type_short_label_overrides"] = normalize_ppe_type_short_label_overrides({})
+    saved = await set_ppe_settings(interaction, settings)
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def backfill_legacy_ppe_type_options(
+    interaction: discord.Interaction,
+) -> tuple[int, int]:
+    records = await load_player_records(interaction)
+    players_touched = 0
+    ppes_touched = 0
+
+    for player_data in records.values():
+        player_changed = False
+        for ppe in player_data.ppes:
+            normalized_options = normalize_ppe_type_options(
+                getattr(ppe, "ppe_type_options", None),
+                current_type=getattr(ppe, "ppe_type", None),
+            )
+            current_options = getattr(ppe, "ppe_type_options", None)
+            if current_options != normalized_options:
+                ppe.ppe_type_options = normalized_options
+                ppes_touched += 1
+                player_changed = True
+
+        if player_changed:
+            players_touched += 1
+
+    if ppes_touched > 0:
+        await save_player_records(interaction, records)
+
+    return players_touched, ppes_touched
+
+
 async def update_global_point_modifiers(
     interaction: discord.Interaction,
     *,
@@ -843,6 +1080,9 @@ def _clear_team_quest_mode_state(config: dict[str, Any], *, disable_team_mode: b
 
 async def reset_all_ppe_characters(interaction: discord.Interaction) -> ResetPPECharactersSummary:
     """Reset all character records while preserving seasonal and quest progress."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+    
     records = await load_player_records(interaction)
 
     players_updated = 0
@@ -865,6 +1105,10 @@ async def reset_all_ppe_characters(interaction: discord.Interaction) -> ResetPPE
             players_updated += 1
 
     await save_player_records(interaction, records)
+    
+    # Clear all duo partner linkages
+    await clear_all_group_ppes(interaction.guild.id)
+    
     return ResetPPECharactersSummary(
         players_updated=players_updated,
         ppes_cleared=ppes_cleared,
@@ -1103,6 +1347,14 @@ async def reset_admin_tunable_settings_to_defaults(interaction: discord.Interact
     reset_contest_settings["join_contest_message_id"] = preserved_join_message_id
     reset_contest_settings["join_contest_emoji"] = preserved_join_emoji
     reset_config["contest_settings"] = reset_contest_settings
+
+    # Reset PPE type configurations to defaults
+    reset_ppe_settings = dict(reset_config.get("ppe_settings", {}))
+    reset_ppe_settings["ppe_type_multipliers"] = normalize_ppe_type_multipliers(DEFAULT_PPE_TYPE_MULTIPLIERS)
+    reset_ppe_settings["iterative_base_multipliers"] = normalize_iterative_combo_overrides(DEFAULT_ITERATIVE_OPTION_MULTIPLIERS)
+    reset_ppe_settings["iterative_combo_overrides"] = normalize_iterative_combo_overrides({})
+    reset_ppe_settings["iterative_cleared_signatures"] = normalize_cleared_combo_signatures([])
+    reset_config["ppe_settings"] = reset_ppe_settings
 
     await save_guild_config(interaction, reset_config)
 

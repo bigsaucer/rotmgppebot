@@ -3,7 +3,16 @@
 import discord
 
 from menus.menu_utils.base_views import OwnerBoundView
+from utils.guild_config import load_guild_config
+from utils.pagination import chunk_lines_to_pages
 from utils.ppe_types import (
+    all_ppe_types,
+    get_ppe_type_multiplier_details_from_options,
+    legacy_ppe_type_to_options,
+    normalize_combo_signature,
+    normalize_iterative_combo_overrides,
+    normalize_ppe_combo_label_overrides,
+    options_from_signature,
     PPE_TYPE_DIVINE_ONLY,
     PPE_TYPE_DIVINE_SHINY,
     PPE_TYPE_DIVINE_NO_PET,
@@ -18,7 +27,12 @@ from utils.ppe_types import (
     PPE_TYPE_SHINY_NO_PET,
     PPE_TYPE_UT_ONLY,
     PPE_TYPE_UT_NO_PET,
+    normalize_iterative_option_multipliers,
+    ppe_type_display_from_options,
+    ppe_type_label,
+    ppe_type_option_signature,
     ppe_type_short_label,
+    resolve_legacy_ppe_type_from_options,
 )
 
 
@@ -62,9 +76,11 @@ class HelpSectionButton(discord.ui.Button):
 
 
 class PPEHelpView(OwnerBoundView):
-    def __init__(self, owner_id: int):
+    def __init__(self, owner_id: int, *, ppe_settings: dict | None = None):
         super().__init__(owner_id=owner_id, timeout=600)
         self.current_section = "home"
+        self.types_overrides_page_index = 0
+        self.ppe_settings = ppe_settings if isinstance(ppe_settings, dict) else {}
 
         for index, section_key in enumerate(SECTIONS):
             row = 0 if index < 5 else 1
@@ -79,6 +95,7 @@ class PPEHelpView(OwnerBoundView):
             )
         )
         self._sync_button_styles()
+        self._sync_types_pagination_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not await super().interaction_check(interaction):
@@ -102,11 +119,112 @@ class PPEHelpView(OwnerBoundView):
                 else discord.ButtonStyle.primary
             )
 
+    def _sync_types_pagination_buttons(self) -> None:
+        total_pages = get_types_override_page_count(self.ppe_settings)
+        is_types_section = self.current_section == "types"
+        show_controls = is_types_section
+        has_prev = self.prev_types_overrides_page in self.children
+        has_next = self.next_types_overrides_page in self.children
+
+        if show_controls:
+            if not has_prev:
+                self.add_item(self.prev_types_overrides_page)
+            if not has_next:
+                self.add_item(self.next_types_overrides_page)
+        else:
+            if has_prev:
+                self.remove_item(self.prev_types_overrides_page)
+            if has_next:
+                self.remove_item(self.next_types_overrides_page)
+
+        controls_disabled = total_pages <= 1
+        self.prev_types_overrides_page.disabled = controls_disabled
+        self.next_types_overrides_page.disabled = controls_disabled
+        if total_pages > 0 and self.types_overrides_page_index >= total_pages:
+            self.types_overrides_page_index = total_pages - 1
+
     async def show_section(self, interaction: discord.Interaction, section_key: str) -> None:
         self.current_section = section_key
+        if section_key != "types":
+            self.types_overrides_page_index = 0
         self._sync_button_styles()
-        embed = build_help_embed(section_key)
+        self._sync_types_pagination_buttons()
+        embed = build_help_embed(
+            section_key,
+            ppe_settings=self.ppe_settings,
+            types_overrides_page_index=self.types_overrides_page_index,
+        )
         await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Prev Overrides", style=discord.ButtonStyle.secondary, row=2)
+    async def prev_types_overrides_page(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if self.current_section != "types":
+            await interaction.response.edit_message(
+                embed=build_help_embed(
+                    self.current_section,
+                    ppe_settings=self.ppe_settings,
+                    types_overrides_page_index=self.types_overrides_page_index,
+                ),
+                view=self,
+            )
+            return
+        total_pages = get_types_override_page_count(self.ppe_settings)
+        if total_pages <= 1:
+            self._sync_types_pagination_buttons()
+            await interaction.response.edit_message(
+                embed=build_help_embed(
+                    self.current_section,
+                    ppe_settings=self.ppe_settings,
+                    types_overrides_page_index=self.types_overrides_page_index,
+                ),
+                view=self,
+            )
+            return
+        self.types_overrides_page_index = (self.types_overrides_page_index - 1) % total_pages
+        self._sync_types_pagination_buttons()
+        await interaction.response.edit_message(
+            embed=build_help_embed(
+                self.current_section,
+                ppe_settings=self.ppe_settings,
+                types_overrides_page_index=self.types_overrides_page_index,
+            ),
+            view=self,
+        )
+
+    @discord.ui.button(label="Next Overrides", style=discord.ButtonStyle.secondary, row=2)
+    async def next_types_overrides_page(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if self.current_section != "types":
+            await interaction.response.edit_message(
+                embed=build_help_embed(
+                    self.current_section,
+                    ppe_settings=self.ppe_settings,
+                    types_overrides_page_index=self.types_overrides_page_index,
+                ),
+                view=self,
+            )
+            return
+        total_pages = get_types_override_page_count(self.ppe_settings)
+        if total_pages <= 1:
+            self._sync_types_pagination_buttons()
+            await interaction.response.edit_message(
+                embed=build_help_embed(
+                    self.current_section,
+                    ppe_settings=self.ppe_settings,
+                    types_overrides_page_index=self.types_overrides_page_index,
+                ),
+                view=self,
+            )
+            return
+        self.types_overrides_page_index = (self.types_overrides_page_index + 1) % total_pages
+        self._sync_types_pagination_buttons()
+        await interaction.response.edit_message(
+            embed=build_help_embed(
+                self.current_section,
+                ppe_settings=self.ppe_settings,
+                types_overrides_page_index=self.types_overrides_page_index,
+            ),
+            view=self,
+        )
 
 
 def _divider() -> str:
@@ -117,7 +235,92 @@ def _common_footer() -> str:
     return "Use /ppehelp anytime."
 
 
-def build_help_embed(section_key: str) -> discord.Embed:
+def _build_iterative_defaults_lines(ppe_settings: dict | None) -> list[str]:
+    base = (
+        ppe_settings.get("iterative_base_multipliers", {})
+        if isinstance(ppe_settings, dict) and isinstance(ppe_settings.get("iterative_base_multipliers"), dict)
+        else {}
+    )
+    multipliers = normalize_iterative_option_multipliers(base)
+    rarity = multipliers.get("minimum_rarity", {}) if isinstance(multipliers.get("minimum_rarity"), dict) else {}
+    return [
+        f"- No Pet: x{float(multipliers.get('no_pet', 1.3)):.2f}",
+        f"- No Tiered: x{float(multipliers.get('no_tiered', 1.3)):.2f}",
+        f"- Minimum rarity: Common x{float(rarity.get('common', 1.0)):.2f}, Uncommon x{float(rarity.get('uncommon', 1.1)):.2f}, Rare x{float(rarity.get('rare', 1.2)):.2f}, Legendary x{float(rarity.get('legendary', 1.4)):.2f}, Divine x{float(rarity.get('divine', 1.5)):.2f}",
+        f"- Shiny Only: x{float(multipliers.get('shiny_only', 1.5)):.2f}",
+        f"- Enforce Shiny Rarity: x{float(multipliers.get('enforce_shiny_rarity', 0.9)):.2f}",
+        f"- Duo: x{float(multipliers.get('duo', 0.6)):.2f}",
+    ]
+
+
+def _build_types_override_lines(ppe_settings: dict | None) -> list[str]:
+    settings = ppe_settings if isinstance(ppe_settings, dict) else {}
+    lines: list[str] = []
+
+    for ppe_type in all_ppe_types():
+        options = legacy_ppe_type_to_options(ppe_type)
+        details = get_ppe_type_multiplier_details_from_options(options, settings, current_type=ppe_type)
+        value = float(details.get("multiplier", 1.0))
+        source = str(details.get("source", "base")).strip().lower()
+        source_suffix = ""
+        if source == "override":
+            source_suffix = " (combo override)"
+        elif source == "preset":
+            source_suffix = " (default override)"
+        lines.append(
+            f"- {ppe_type_label(ppe_type, ppe_settings=settings)} [{ppe_type_short_label(ppe_type, ppe_settings=settings)}]: x{value:.2f}{source_suffix}"
+        )
+
+    combo_overrides = normalize_iterative_combo_overrides(settings.get("iterative_combo_overrides"))
+    combo_labels = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
+    candidate_signatures: set[str] = set()
+    for raw_signature in list(combo_overrides.keys()) + list(combo_labels.keys()):
+        signature = normalize_combo_signature(raw_signature)
+        if signature and signature != "regular":
+            candidate_signatures.add(signature)
+
+    for signature in sorted(candidate_signatures):
+        options = options_from_signature(signature)
+        if not isinstance(options, dict):
+            continue
+
+        legacy_type = resolve_legacy_ppe_type_from_options(options)
+        if legacy_type is not None:
+            legacy_signature = ppe_type_option_signature(legacy_ppe_type_to_options(legacy_type))
+            if signature == legacy_signature:
+                continue
+
+        details = get_ppe_type_multiplier_details_from_options(options, settings)
+        value = float(details.get("multiplier", 1.0))
+        source = str(details.get("source", "base")).strip().lower()
+        source_suffix = ""
+        if source == "override":
+            source_suffix = " (combo override)"
+        elif source == "preset":
+            source_suffix = " (default override)"
+        lines.append(
+            f"- {ppe_type_display_from_options(options, ppe_settings=settings, compact=False)} [{ppe_type_display_from_options(options, ppe_settings=settings, compact=True)}]: x{value:.2f}{source_suffix}"
+        )
+
+    return lines
+
+
+def _types_override_pages(ppe_settings: dict | None) -> list[list[str]]:
+    lines = _build_types_override_lines(ppe_settings)
+    pages = chunk_lines_to_pages(lines, 950)
+    return pages if pages else [["- No overrides configured."]]
+
+
+def get_types_override_page_count(ppe_settings: dict | None) -> int:
+    return len(_types_override_pages(ppe_settings))
+
+
+def build_help_embed(
+    section_key: str,
+    *,
+    ppe_settings: dict | None = None,
+    types_overrides_page_index: int = 0,
+) -> discord.Embed:
     if section_key == "home":
         embed = discord.Embed(
             title="PPE Bot Help - Home",
@@ -165,31 +368,47 @@ def build_help_embed(section_key: str) -> discord.Embed:
         embed = discord.Embed(
             title="PPE Bot Help - Types of PPEs",
             description=(
-                "The PPE types available in your server may change depending on what admins configure in "
-                "`/manageseason` under Character Settings."
+                "PPE type scoring is now option-based. You choose rules, and the bot builds your type summary and multiplier."
             ),
             color=discord.Color.blurple(),
         )
         lines = [
-            f"- **{ppe_type_short_label(PPE_TYPE_REGULAR)}**: Standard PPE rules.",
-            f"- **{ppe_type_short_label(PPE_TYPE_DUO)}**: Run with a duo partner.",
-            f"- **{ppe_type_short_label(PPE_TYPE_DUO_NO_PET)}**: Duo partner rules with no pet.",
-            f"- **{ppe_type_short_label(PPE_TYPE_DIVINE_ONLY)}**: Divine-only challenge rules.",
-            f"- **{ppe_type_short_label(PPE_TYPE_DIVINE_NO_PET)}**: Divine-only challenge rules with no pet.",
-            f"- **{ppe_type_short_label(PPE_TYPE_UT_ONLY)}**: UT-only challenge rules.",
-            f"- **{ppe_type_short_label(PPE_TYPE_UT_NO_PET)}**: UT-only challenge rules with no pet.",
-            f"- **{ppe_type_short_label(PPE_TYPE_SHINY_ONLY)}**: Shiny-only challenge rules.",
-            f"- **{ppe_type_short_label(PPE_TYPE_SHINY_NO_PET)}**: Shiny-only challenge rules with no pet.",
-            f"- **{ppe_type_short_label(PPE_TYPE_LEGENDARY_OR_SHINY)}**: Legendary-or-shiny challenge rules.",
-            f"- **{ppe_type_short_label(PPE_TYPE_LEGENDARY_OR_SHINY_NO_PET)}**: Legendary-or-shiny challenge rules with no pet.",
-            f"- **{ppe_type_short_label(PPE_TYPE_NO_PET)}**: No-pet challenge rules.",
-            f"- **{ppe_type_short_label(PPE_TYPE_DIVINE_SHINY)}**: Divine + Shiny combined challenge.",
-            f"- **{ppe_type_short_label(PPE_TYPE_DIVINE_SHINY_NO_PET)}**: Divine + Shiny combined challenge with no pet.",
+            "- Regular PPE: skips most option questions and keeps baseline type rules.",
+            "- Duo PPE: applies the Duo factor and needs a duo partner ID to stay duo-enabled.",
+            "- Custom PPE: any option combination that does not match a legacy preset type is shown as Custom PPE.",
         ]
-        embed.add_field(name="Available PPE Types", value="\n".join(lines), inline=False)
+        lines.extend(_build_iterative_defaults_lines(ppe_settings))
+        lines.append("- Enforce rarity on shiny: if enabled with high rarity, extra stacking can apply.")
+        lines.append("- Duo: uses the configured duo multiplier and requires your partner Discord ID.")
+        embed.add_field(name="Option Multipliers (Defaults)", value="\n".join(lines), inline=False)
         embed.add_field(
-            name="Tip",
-            value="Use `/newppe` (or MyInfo -> Manage Characters -> New PPE) to pick a type when multiple are enabled.",
+            name="Shorthand Tokens",
+            value=(
+                "- `NPE`: no pet\n"
+                "- `UT0`: no tiered\n"
+                "- `MINU/MINR/MINL/MIND`: minimum rarity\n"
+                "- `SH`: shiny only\n"
+                "- `ERS`: enforce rarity on shiny\n"
+                "- `DUO`: duo enabled"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Custom Names and Shorthands",
+            value=(
+                "Admins can customize labels in `/manageseason -> Manage Point Settings -> Edit PPE Type`.\n"
+                "Use combo overrides to set custom names/shorthands for specific option-combination signatures."
+            ),
+            inline=False,
+        )
+        override_pages = _types_override_pages(ppe_settings)
+        total_pages = len(override_pages)
+        page_index = max(0, min(int(types_overrides_page_index), total_pages - 1)) if total_pages > 0 else 0
+        override_lines = override_pages[page_index] if total_pages > 0 else ["- No overrides configured."]
+        page_suffix = f" (Page {page_index + 1}/{total_pages})" if total_pages > 1 else ""
+        embed.add_field(
+            name=f"Current Type/Combo Overrides{page_suffix}",
+            value="\n".join(override_lines) if override_lines else "- No overrides configured.",
             inline=False,
         )
         embed.set_footer(text=_common_footer())
@@ -401,6 +620,8 @@ def build_help_embed(section_key: str) -> discord.Embed:
 
 
 async def command(interaction: discord.Interaction):
-    view = PPEHelpView(owner_id=interaction.user.id)
-    embed = build_help_embed("home")
+    guild_config = await load_guild_config(interaction)
+    ppe_settings = guild_config.get("ppe_settings", {}) if isinstance(guild_config.get("ppe_settings"), dict) else {}
+    view = PPEHelpView(owner_id=interaction.user.id, ppe_settings=ppe_settings)
+    embed = build_help_embed("home", ppe_settings=ppe_settings, types_overrides_page_index=0)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)

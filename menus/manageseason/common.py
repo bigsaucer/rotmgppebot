@@ -5,7 +5,22 @@ from __future__ import annotations
 import discord
 
 from menus.manageseason.services import SeasonResetSummary
-from utils.ppe_types import all_ppe_types, ppe_type_label
+from utils.pagination import chunk_lines_to_pages
+from utils.ppe_types import (
+    all_ppe_types,
+    get_ppe_type_multiplier_details_from_options,
+    legacy_ppe_type_to_options,
+    normalize_combo_signature,
+    normalize_iterative_combo_overrides,
+    normalize_iterative_option_multipliers,
+    normalize_ppe_combo_label_overrides,
+    ppe_type_display_from_options,
+    ppe_type_label,
+    ppe_type_option_signature,
+    ppe_type_short_label,
+    resolve_legacy_ppe_type_from_options,
+    options_from_signature,
+)
 from utils.contest_leaderboards import CONTEST_LEADERBOARD_OPTIONS, contest_leaderboard_label
 
 
@@ -39,15 +54,135 @@ def _build_class_override_lines(class_overrides: dict) -> list[str]:
     return lines
 
 
-def _build_ppe_type_multiplier_lines(multipliers: dict) -> list[str]:
+def _build_ppe_type_multiplier_lines(*, ppe_settings: dict | None = None) -> list[str]:
     lines: list[str] = []
+    settings = ppe_settings if isinstance(ppe_settings, dict) else {}
     for ppe_type in all_ppe_types():
-        value = 1.0
         try:
-            value = float(multipliers.get(ppe_type, 1.0))
+            options = legacy_ppe_type_to_options(ppe_type)
+            details = get_ppe_type_multiplier_details_from_options(options, settings, current_type=ppe_type)
+            value = float(details.get("multiplier", 1.0))
+            source = str(details.get("source", "base")).strip().lower()
         except (TypeError, ValueError):
             value = 1.0
-        lines.append(f"• {ppe_type_label(ppe_type)}: {value:.2f}x")
+            source = "base"
+        full_label = ppe_type_label(ppe_type, ppe_settings=ppe_settings)
+        short_label = ppe_type_short_label(ppe_type, ppe_settings=ppe_settings)
+        source_suffix = ""
+        if source == "override":
+            source_suffix = " (combo override)"
+        elif source == "preset":
+            source_suffix = " (default override)"
+        lines.append(f"• {full_label} [{short_label}]: {value:.2f}x{source_suffix}")
+
+    # Show all known custom (non-legacy) combo signatures inline with PPE types.
+    combo_overrides = normalize_iterative_combo_overrides(settings.get("iterative_combo_overrides"))
+    combo_labels = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
+    observed_raw = settings.get("observed_combo_signatures")
+    observed_signatures = observed_raw if isinstance(observed_raw, list) else []
+
+    candidate_signatures: set[str] = set()
+    for raw_signature in list(combo_overrides.keys()) + list(combo_labels.keys()) + observed_signatures:
+        normalized_signature = normalize_combo_signature(raw_signature)
+        if normalized_signature and normalized_signature != "regular":
+            candidate_signatures.add(normalized_signature)
+
+    for signature in sorted(candidate_signatures):
+        options = options_from_signature(signature)
+        if not isinstance(options, dict):
+            continue
+
+        legacy_type = resolve_legacy_ppe_type_from_options(options)
+        if legacy_type is not None:
+            legacy_signature = ppe_type_option_signature(legacy_ppe_type_to_options(legacy_type))
+            if signature == legacy_signature:
+                continue
+
+        details = get_ppe_type_multiplier_details_from_options(options, settings)
+        value = float(details.get("multiplier", 1.0))
+        source = str(details.get("source", "base")).strip().lower()
+        source_suffix = ""
+        if source == "override":
+            source_suffix = " (combo override)"
+        elif source == "preset":
+            source_suffix = " (default override)"
+        full_label = ppe_type_display_from_options(options, ppe_settings=settings, compact=False)
+        short_label = ppe_type_display_from_options(options, ppe_settings=settings, compact=True)
+        lines.append(f"• {full_label} [{short_label}]: {value:.2f}x{source_suffix}")
+    return lines
+
+
+def _paginate_ppe_type_multiplier_lines(*, ppe_settings: dict | None = None) -> list[list[str]]:
+    lines = _build_ppe_type_multiplier_lines(ppe_settings=ppe_settings)
+    pages = chunk_lines_to_pages(lines, 950)
+    return pages if pages else [["• No PPE types configured."]]
+
+
+def get_ppe_type_multiplier_page_count(character_settings: dict) -> int:
+    return len(_paginate_ppe_type_multiplier_lines(ppe_settings=character_settings))
+
+
+def _build_iterative_base_lines(character_settings: dict) -> list[str]:
+    base = (
+        character_settings.get("iterative_base_multipliers", {})
+        if isinstance(character_settings.get("iterative_base_multipliers"), dict)
+        else {}
+    )
+    multipliers = normalize_iterative_option_multipliers(base)
+    rarity = multipliers.get("minimum_rarity", {}) if isinstance(multipliers.get("minimum_rarity"), dict) else {}
+    return [
+        f"• No Pet: {float(multipliers.get('no_pet', 1.3)):.2f}x",
+        f"• No Tiered: {float(multipliers.get('no_tiered', 1.3)):.2f}x",
+        f"• Minimum Rarity: Common {float(rarity.get('common', 1.0)):.2f}x, Uncommon {float(rarity.get('uncommon', 1.1)):.2f}x, Rare {float(rarity.get('rare', 1.2)):.2f}x, Legendary {float(rarity.get('legendary', 1.4)):.2f}x, Divine {float(rarity.get('divine', 1.5)):.2f}x",
+        f"• Shiny Only: {float(multipliers.get('shiny_only', 1.5)):.2f}x",
+        f"• Enforce Shiny Rarity: {float(multipliers.get('enforce_shiny_rarity', 0.9)):.2f}x",
+        "• Enforce applies only when minimum rarity is Legendary or Divine.",
+        "• If Enforce is No: Legendary applies once; Divine applies twice.",
+        f"• Duo: {float(multipliers.get('duo', 0.6)):.2f}x",
+    ]
+
+
+def _build_type_label_override_lines(character_settings: dict) -> list[str]:
+    labels = character_settings.get("type_label_overrides", {}) if isinstance(character_settings.get("type_label_overrides", {}), dict) else {}
+    shorts = character_settings.get("type_short_label_overrides", {}) if isinstance(character_settings.get("type_short_label_overrides", {}), dict) else {}
+    lines: list[str] = []
+    for ppe_type in all_ppe_types():
+        name_value = str(labels.get(ppe_type, "")).strip()
+        short_value = str(shorts.get(ppe_type, "")).strip()
+        if not name_value and not short_value:
+            continue
+        display_name = name_value or ppe_type_label(ppe_type)
+        display_short = short_value or "(auto)"
+        lines.append(f"• {ppe_type}: {display_name} [{display_short}]")
+    return lines
+
+
+def _build_combo_label_override_lines(character_settings: dict) -> list[str]:
+    overrides = character_settings.get("combo_label_overrides", {}) if isinstance(character_settings.get("combo_label_overrides", {}), dict) else {}
+    lines: list[str] = []
+    for signature in sorted(overrides.keys()):
+        entry = overrides.get(signature, {}) if isinstance(overrides.get(signature, {}), dict) else {}
+        name_value = str(entry.get("name", "")).strip() or "(none)"
+        short_value = str(entry.get("short", "")).strip() or "(none)"
+        lines.append(f"• {signature}: {name_value} [{short_value}]")
+    return lines
+
+
+def _build_combo_multiplier_override_lines(character_settings: dict) -> list[str]:
+    overrides = (
+        character_settings.get("iterative_combo_overrides", {})
+        if isinstance(character_settings.get("iterative_combo_overrides", {}), dict)
+        else {}
+    )
+    lines: list[str] = []
+    for signature in sorted(overrides.keys()):
+        try:
+            multiplier = float(overrides.get(signature, 0.0))
+        except (TypeError, ValueError):
+            continue
+        if multiplier <= 0:
+            continue
+        lines.append(f"• {signature}: {multiplier:.2f}x")
     return lines
 
 
@@ -678,26 +813,37 @@ def build_point_settings_embed(settings: dict) -> discord.Embed:
     )
     embed.add_field(
         name="PPE Type Multipliers",
-        value="Use **Edit PPE Type Points** to manage final-score multipliers per PPE type.",
+        value="Use **Edit PPE Type** to manage final-score multipliers per PPE type.",
         inline=False,
     )
     embed.set_footer(text="Any points-setting change triggers a full PPE points recalculation.")
     return embed
 
 
-def build_ppe_type_points_embed(character_settings: dict) -> discord.Embed:
-    multipliers = (
-        character_settings.get("ppe_type_multipliers", {})
-        if isinstance(character_settings.get("ppe_type_multipliers"), dict)
-        else {}
-    )
-    lines = _build_ppe_type_multiplier_lines(multipliers)
+def build_ppe_type_points_embed(character_settings: dict, *, types_page_index: int = 0) -> discord.Embed:
+    pages = _paginate_ppe_type_multiplier_lines(ppe_settings=character_settings)
+    total_pages = len(pages)
+    page_index = max(0, min(int(types_page_index), total_pages - 1)) if total_pages > 0 else 0
+    lines = pages[page_index] if total_pages > 0 else ["• No PPE types configured."]
+    iterative_base_lines = _build_iterative_base_lines(character_settings)
     embed = discord.Embed(
         title="PPE Type Point Multipliers",
-        description="Edit how much each PPE type scales final points.",
+        description="Configure how PPE type rules translate into final point multipliers and labels.",
         color=discord.Color.dark_teal(),
     )
-    embed.add_field(name="Current Multipliers", value="\n".join(lines), inline=False)
+    page_suffix = f" (Page {page_index + 1}/{total_pages})" if total_pages > 1 else ""
+    embed.add_field(name=f"Current PPE Types{page_suffix}", value="\n".join(lines), inline=False)
+    embed.add_field(name="Iterative Base Multipliers", value="\n".join(iterative_base_lines), inline=False)
+    embed.add_field(
+        name="Button Guide",
+        value=(
+            "• Edit Combo Multiplier: searches current PPE type labels, short labels, combo labels, or signatures.\n"
+            "• Edit Iterative Base Multipliers: edits per-rule factors (No Pet, No Tiered, rarity, shiny, duo).\n"
+            "• Reset All Overrides: choose `all` to clear combo + type labels, or `combo` to clear only combo-specific overrides.\n"
+            "• Backfill Legacy Fields: migrates older data fields to newer type/option storage."
+        ),
+        inline=False,
+    )
     embed.set_footer(text="Changing multipliers recalculates all character totals immediately.")
     return embed
 

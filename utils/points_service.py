@@ -1,10 +1,18 @@
 """Utilities for points service."""
 
+from copy import deepcopy
 import math
 from typing import Any, Dict, Iterable
 
 from dataclass import Bonus, Loot, PPEData
-from utils.ppe_types import DEFAULT_PPE_TYPE_MULTIPLIERS, normalize_ppe_type, normalize_ppe_type_multipliers
+from utils.ppe_types import (
+    DEFAULT_PPE_TYPE_MULTIPLIERS,
+    get_ppe_type_multiplier_details_from_options,
+    options_from_signature,
+    normalize_ppe_type,
+    normalize_ppe_type_multipliers,
+    ppe_type_compact_summary,
+)
 from utils.calc_points import load_loot_points, load_loot_types, normalize_item_name
 from utils.guild_config import get_rarity_multipliers
 from utils.loot_constants import normalize_rarity
@@ -134,10 +142,42 @@ def get_ppe_type_multiplier_for_ppe(
     ppe: PPEData,
     guild_config: Dict[str, Any] | None = None,
 ) -> float:
+    details = get_ppe_type_multiplier_details_for_ppe(ppe, guild_config)
+    return float(details["multiplier"])
+
+
+def get_ppe_type_multiplier_details_for_ppe(
+    ppe: PPEData,
+    guild_config: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     ppe_settings = _get_ppe_settings(guild_config)
-    normalized_multipliers = normalize_ppe_type_multipliers(ppe_settings.get("ppe_type_multipliers"))
+    raw_options = getattr(ppe, "ppe_type_options", None)
+
+    if isinstance(raw_options, dict) and raw_options:
+        details = get_ppe_type_multiplier_details_from_options(
+            raw_options,
+            ppe_settings,
+            current_type=getattr(ppe, "ppe_type", None),
+        )
+        return {
+            "multiplier": float(details["multiplier"]),
+            "source": str(details.get("source", "base")),
+            "signature": str(details.get("signature", "legacy")),
+            "legacy_type": details.get("legacy_type"),
+            "components": list(details.get("components", [])),
+            "component_lines": list(details.get("component_lines", [])),
+        }
+
     ppe_type = normalize_ppe_type(getattr(ppe, "ppe_type", None))
-    return float(normalized_multipliers.get(ppe_type, DEFAULT_PPE_TYPE_MULTIPLIERS["regular"]))
+    normalized_multipliers = normalize_ppe_type_multipliers(ppe_settings.get("ppe_type_multipliers"))
+    return {
+        "multiplier": float(normalized_multipliers.get(ppe_type, DEFAULT_PPE_TYPE_MULTIPLIERS["regular"])),
+        "source": "legacy",
+        "signature": "legacy",
+        "legacy_type": ppe_type,
+        "components": [],
+        "component_lines": [],
+    }
 
 
 def _get_penalty_weights(guild_config: Dict[str, Any] | None) -> Dict[str, float]:
@@ -389,7 +429,8 @@ def loot_adjustments_for_ppe(
     modifier_bucket = get_effective_modifier_bucket_for_ppe(ppe, guild_config)
     loot_multiplier = apply_percent_modifier(1.0, _as_float(modifier_bucket.get("loot_percent"), 0.0))
     total_multiplier = apply_percent_modifier(1.0, _as_float(modifier_bucket.get("total_percent"), 0.0))
-    type_multiplier = get_ppe_type_multiplier_for_ppe(ppe, guild_config)
+    multiplier_details = get_ppe_type_multiplier_details_for_ppe(ppe, guild_config)
+    type_multiplier = float(multiplier_details["multiplier"])
     combined_multiplier = reduction_multiplier * loot_multiplier * total_multiplier * type_multiplier
     return {
         "pet_reduction_percent": float(reduction_breakdown["pet_reduction_percent"]),
@@ -401,8 +442,73 @@ def loot_adjustments_for_ppe(
         "loot_percent_multiplier": loot_multiplier,
         "total_percent_multiplier": total_multiplier,
         "type_multiplier": type_multiplier,
+        "type_multiplier_source": str(multiplier_details.get("source", "legacy")),
+        "type_multiplier_signature": str(multiplier_details.get("signature", "legacy")),
+        "type_multiplier_component_lines": list(multiplier_details.get("component_lines", [])),
         "combined_item_multiplier": combined_multiplier,
     }
+
+
+def _format_multiplier(value: float) -> str:
+    rounded = round(float(value), 2)
+    if rounded.is_integer():
+        return f"{int(rounded)}x"
+    return f"{rounded:.2f}".rstrip("0").rstrip(".") + "x"
+
+
+def loot_adjustment_detail_lines(loot_adjustments: Dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+
+    component_rows = (
+        ("pet_reduction_percent", "Pet Level"),
+        ("exalts_reduction_percent", "Exalts"),
+        ("loot_reduction_percent", "Loot Boost"),
+        ("incombat_reduction_percent", "In-Combat Reduction"),
+    )
+
+    for key, label in component_rows:
+        percent = _as_float(loot_adjustments.get(key), 0.0)
+        if abs(percent) <= 1e-9:
+            continue
+        multiplier = max(0.0, 1.0 - (percent / 100.0))
+        lines.append(f"{label}: -{percent:.2f}% ({_format_multiplier(multiplier)})")
+
+    total_reduction_percent = _as_float(loot_adjustments.get("total_reduction_percent"), 0.0)
+    if abs(total_reduction_percent) > 1e-9:
+        reduction_multiplier = _as_float(loot_adjustments.get("reduction_multiplier"), 1.0)
+        lines.append(f"Stat Reduction: -{total_reduction_percent:.2f}% ({_format_multiplier(reduction_multiplier)})")
+
+    type_multiplier = _as_float(loot_adjustments.get("type_multiplier"), 1.0)
+    type_source = str(loot_adjustments.get("type_multiplier_source", "")).strip().lower()
+    type_signature = str(loot_adjustments.get("type_multiplier_signature", "")).strip()
+    type_summary = ""
+    if type_signature and type_signature != "legacy":
+        options = options_from_signature(type_signature)
+        if options is not None:
+            type_summary = ppe_type_compact_summary(options)
+
+    if type_summary:
+        if type_source == "preset":
+            lines.append(f"Type Multiplier ({type_summary}): {type_multiplier:.2f} (overridden)")
+        else:
+            lines.append(f"Type Multiplier ({type_summary}): {_format_multiplier(type_multiplier)}")
+    else:
+        if type_source == "preset":
+            lines.append(f"Type Multiplier: {type_multiplier:.2f} (overridden)")
+        else:
+            lines.append(f"Type Multiplier: {_format_multiplier(type_multiplier)}")
+
+    type_component_lines = loot_adjustments.get("type_multiplier_component_lines", [])
+    if isinstance(type_component_lines, list):
+        for raw_line in type_component_lines:
+            detail = str(raw_line or "").strip()
+            if detail:
+                lines.append(f"  - {detail}")
+
+    combined_multiplier = _as_float(loot_adjustments.get("combined_item_multiplier"), 1.0)
+    lines.append(f"Combined Multiplier: {_format_multiplier(combined_multiplier)}")
+
+    return lines
 
 
 def _format_points(value: float) -> str:
@@ -625,6 +731,20 @@ def get_set_bonus_points_from_config(ppe: PPEData, guild_config: Dict[str, Any] 
                 total_set_bonus += set_bonuses[set_type][set_name]
     
     return total_set_bonus
+
+
+def compute_effective_ppe_points(
+    ppe: PPEData,
+    guild_config: Dict[str, Any] | None = None,
+) -> float:
+    """Compute points for a PPE using current config without mutating the original object."""
+    try:
+        ppe_copy = deepcopy(ppe)
+    except Exception:
+        return _as_float(getattr(ppe, "points", 0.0), 0.0)
+
+    breakdown = recompute_ppe_points(ppe_copy, guild_config)
+    return _as_float(breakdown.get("total", getattr(ppe_copy, "points", 0.0)), 0.0)
 
 
 def recompute_ppe_points(ppe: PPEData, guild_config: Dict[str, Any] | None = None) -> Dict[str, float]:

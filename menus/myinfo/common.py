@@ -8,13 +8,20 @@ import discord
 
 from dataclass import PPEData, PlayerData
 from menus.menu_utils import SafeResponse
-from utils.ppe_types import normalize_ppe_type, ppe_type_label, ppe_type_short_label
+from utils.group_ppes import duo_partner_id_from_options, duo_link_id_from_options
+from utils.ppe_types import is_duo_ppe_type, normalize_ppe_type, ppe_type_compact_summary, ppe_type_display_from_options
 from utils.guild_config import get_realmshark_settings, load_guild_config
 from utils.loot_helpers.loot_share_commands import share_active_ppe_loot_image
 from utils.message_utils.loot_table_md_builder import create_loot_markdown_file, create_season_loot_markdown_file
 from utils.message_utils.ppe_list_md_builder import create_ppe_list_markdown_file
-from utils.points_service import format_starting_penalty_line, penalty_inputs_from_bonuses, starting_penalty_breakdown_from_inputs
-from utils.points_service import loot_adjustments_for_ppe, recompute_ppe_points
+from utils.points_service import (
+    format_starting_penalty_line,
+    loot_adjustment_detail_lines,
+    loot_adjustments_for_ppe,
+    penalty_inputs_from_bonuses,
+    recompute_ppe_points,
+    starting_penalty_breakdown_from_inputs,
+)
 from utils.player_records import ensure_player_exists, load_player_records, save_player_records
 from utils.season_loot_history import iter_season_variants, unique_season_item_count
 
@@ -44,16 +51,92 @@ def get_best_ppe(player_data: PlayerData) -> PPEData | None:
     return max(sorted_ppes, key=lambda p: float(p.points), default=None)
 
 
-def ppe_type_text(ppe: PPEData, *, compact: bool = False) -> str:
+def ppe_type_text(ppe: PPEData, *, compact: bool = False, guild_config: dict | None = None) -> str:
     normalized = normalize_ppe_type(getattr(ppe, "ppe_type", None))
+    options = getattr(ppe, "ppe_type_options", None)
+    ppe_settings = guild_config.get("ppe_settings", {}) if isinstance(guild_config, dict) and isinstance(guild_config.get("ppe_settings", {}), dict) else None
     if compact:
-        return ppe_type_short_label(normalized)
+        return ppe_type_compact_summary(options, fallback_type=normalized, ppe_settings=ppe_settings)
+    return ppe_type_display_from_options(
+        options,
+        fallback_type=normalized,
+        ppe_settings=ppe_settings,
+        compact=False,
+    )
 
-    full = ppe_type_label(normalized)
-    short = ppe_type_short_label(normalized)
-    if full == short:
-        return full
-    return f"{full} ({short})"
+
+def duo_partner_label_for_ppe(ppe: PPEData, guild: discord.Guild | None = None) -> str | None:
+    options = getattr(ppe, "ppe_type_options", None)
+    partner_id = duo_partner_id_from_options(options)
+    if partner_id is None:
+        return None
+
+    if guild is not None:
+        member = guild.get_member(partner_id)
+        if member is not None:
+            return member.display_name
+
+    return f"<@{partner_id}>"
+
+
+def duo_link_id_for_ppe(ppe: PPEData) -> str | None:
+    return duo_link_id_from_options(getattr(ppe, "ppe_type_options", None))
+
+
+def duo_partner_details_for_ppe(
+    ppe: PPEData,
+    *,
+    owner_user_id: int,
+    records: dict[int, PlayerData] | None,
+    guild: discord.Guild | None = None,
+    guild_config: dict | None = None,
+) -> str | None:
+    options = getattr(ppe, "ppe_type_options", None)
+    partner_id = duo_partner_id_from_options(options)
+    if partner_id is None:
+        return None
+
+    if guild is not None:
+        member = guild.get_member(partner_id)
+        partner_label = member.display_name if member is not None else f"<@{partner_id}>"
+    else:
+        partner_label = f"<@{partner_id}>"
+
+    if not isinstance(records, dict):
+        return partner_label
+
+    partner_data = records.get(int(partner_id))
+    if partner_data is None:
+        return partner_label
+
+    expected_link_id = duo_link_id_for_ppe(ppe)
+    fallback_match: PPEData | None = None
+    matched_partner_ppe: PPEData | None = None
+
+    for candidate in getattr(partner_data, "ppes", []):
+        candidate_options = getattr(candidate, "ppe_type_options", None)
+        candidate_partner_id = duo_partner_id_from_options(candidate_options)
+        if candidate_partner_id != int(owner_user_id):
+            continue
+
+        if fallback_match is None:
+            fallback_match = candidate
+
+        if expected_link_id is None:
+            continue
+        if duo_link_id_for_ppe(candidate) == expected_link_id:
+            matched_partner_ppe = candidate
+            break
+
+    partner_ppe = matched_partner_ppe or fallback_match
+    if partner_ppe is None:
+        return partner_label
+
+    partner_type = ppe_type_text(partner_ppe, compact=True, guild_config=guild_config)
+    return (
+        f"{partner_label}\n"
+        f"Linked PPE: #{partner_ppe.id} - {display_class_name(partner_ppe)} [{partner_type}]"
+    )
 
 
 def penalty_stats_text(ppe: PPEData, guild_config: dict | None = None) -> str:
@@ -92,19 +175,8 @@ def penalty_input_defaults(ppe: PPEData, guild_config: dict | None = None) -> di
 
 
 def loot_adjustments_text(ppe: PPEData, guild_config: dict | None = None) -> str:
-    defaults = penalty_input_defaults(ppe, guild_config)
     adjustments = loot_adjustments_for_ppe(ppe, guild_config)
-    combined_multiplier = float(adjustments["combined_item_multiplier"])
-    
-    return (
-        f"Pet: {int(defaults['pet_level'])} -> -{float(adjustments['pet_reduction_percent']):.2f}%\n"
-        f"Exalts: {int(defaults['num_exalts'])} -> -{float(adjustments['exalts_reduction_percent']):.2f}%\n"
-        f"Loot Boost: {float(defaults['percent_loot']):g}% -> -{float(adjustments['loot_reduction_percent']):.2f}%\n"
-        f"In-Combat: {float(defaults['incombat_reduction']):g}s -> -{float(adjustments['incombat_reduction_percent']):.2f}%\n"
-        f"Stat Reduction: **-{float(adjustments['total_reduction_percent']):.2f}%** ({float(adjustments['reduction_multiplier']):.2f}x)\n"
-        f"Type Multiplier: **{float(adjustments['type_multiplier']):.2f}x**\n"
-        f"Combined Multiplier: **{combined_multiplier:.2f}x**"
-    )
+    return "\n".join(loot_adjustment_detail_lines(adjustments))
 
 
 def build_home_embed(
@@ -166,10 +238,12 @@ def build_character_embed(
     is_active: bool,
     is_best: bool,
     is_realmshark_connected: bool,
+    duo_partner_details: str | None = None,
     guild_config: dict | None = None,
+    guild: discord.Guild | None = None,
 ) -> discord.Embed:
-    character_type = ppe_type_text(ppe)
-    compact_type = ppe_type_text(ppe, compact=True)
+    character_type = ppe_type_text(ppe, guild_config=guild_config)
+    compact_type = ppe_type_text(ppe, compact=True, guild_config=guild_config)
     distinct_loot_items = len([loot for loot in ppe.loot if int(loot.quantity) > 0])
 
     title_prefix: list[str] = []
@@ -196,6 +270,14 @@ def build_character_embed(
     embed.add_field(name="Starting Penalty Stats", value=penalty_stats_text(ppe, guild_config), inline=False)
     embed.add_field(name="Loot Adjustments", value=loot_adjustments_text(ppe, guild_config), inline=False)
     embed.add_field(name="Character Type", value=character_type, inline=True)
+    duo_partner_label = duo_partner_label_for_ppe(ppe, guild)
+    if duo_partner_details is not None:
+        embed.add_field(name="Duo Partner", value=duo_partner_details, inline=True)
+    else:
+        if duo_partner_label is not None:
+            embed.add_field(name="Duo Partner", value=duo_partner_label, inline=True)
+    if duo_partner_details is None and duo_partner_label is None and is_duo_ppe_type(normalize_ppe_type(getattr(ppe, "ppe_type", None))):
+        embed.add_field(name="Duo Partner", value="Not set yet. Use Set Duo Partner to link this legacy duo PPE.", inline=True)
     embed.add_field(name="Active Status", value="⭐ Active PPE" if is_active else "Not Active", inline=True)
 
     embed.set_footer(text="Click Manage PPE to edit starting penalties. Set As Active will cause addloot to add items to this PPE.")
@@ -296,25 +378,40 @@ async def temporarily_switch_active_ppe_and_share(
     *,
     include_skins: bool,
     include_limited: bool,
+    target_user_id: int | None = None,
+    target_display_name: str | None = None,
 ) -> None:
     # Temporarily target the selected PPE so the share helper can reuse active-PPE logic.
     records = await load_player_records(interaction)
-    key = ensure_player_exists(records, interaction.user.id)
+    resolved_target_user_id = int(target_user_id) if target_user_id is not None else int(interaction.user.id)
+    key = ensure_player_exists(records, resolved_target_user_id)
     player_data = records[key]
     old_active = player_data.active_ppe
 
     if old_active == ppe_id:
-        await share_active_ppe_loot_image(interaction, include_skins=include_skins, include_limited=include_limited)
+        await share_active_ppe_loot_image(
+            interaction,
+            include_skins=include_skins,
+            include_limited=include_limited,
+            target_user_id=resolved_target_user_id,
+            target_display_name=target_display_name,
+        )
         return
 
     player_data.active_ppe = ppe_id
     await save_player_records(interaction, records)
 
     try:
-        await share_active_ppe_loot_image(interaction, include_skins=include_skins, include_limited=include_limited)
+        await share_active_ppe_loot_image(
+            interaction,
+            include_skins=include_skins,
+            include_limited=include_limited,
+            target_user_id=resolved_target_user_id,
+            target_display_name=target_display_name,
+        )
     finally:
         records_restore = await load_player_records(interaction)
-        restore_key = ensure_player_exists(records_restore, interaction.user.id)
+        restore_key = ensure_player_exists(records_restore, resolved_target_user_id)
         records_restore[restore_key].active_ppe = old_active
         await save_player_records(interaction, records_restore)
 
