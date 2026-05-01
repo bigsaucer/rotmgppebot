@@ -19,6 +19,7 @@ from utils.player_records import ensure_player_exists, load_player_records, high
 from utils.sniffer_helpers.realmshark_pending_store import append_pending_event, migrate_legacy_pending_map
 from utils.item_log_timestamps import seasonal_item_key
 from utils.season_loot_history import normalize_rarity, unique_season_item_count
+from utils.sniffer_helpers.event_rarity import resolve_event_rarity
 
 
 class IngestValidationError(Exception):
@@ -261,10 +262,11 @@ def _quest_set_progress_suffix(result: Dict[str, Any]) -> str:
     if quest_text and set_text:
         return f" Quest/Set: completed quests: {quest_text}; completed sets: {set_text}."
     if quest_text:
-        return f" Quest/Set: completed quests: {quest_text}; no new sets completed."
+        return f" Quest/Set: completed quests: {quest_text}."
     if set_text:
-        return f" Quest/Set: no new quests completed; completed sets: {set_text}."
-    return " Quest/Set: no new quest or set completed."
+        return f" Quest/Set: completed sets: {set_text}."
+    # No quests or sets completed: don't append any placeholder text
+    return ""
 
 
 def _append_missing_utst_log(guild_id: int, item_name: str, payload: Dict[str, Any]) -> None:
@@ -442,6 +444,13 @@ async def _addseasonloot_with_duplicate_ok(
 
 
 async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None = None) -> Dict[str, Any]:
+    import time
+    from utils.bot_cost_tracking import capture_runtime_snapshot, log_background_cost_event
+    
+    started_monotonic = time.monotonic()
+    started_unix = time.time()
+    snapshot_before = capture_runtime_snapshot()
+    
     try:
         guild_id = int(payload.get("guild_id"))
     except (TypeError, ValueError):
@@ -461,9 +470,7 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
     raw_item_name = str(payload.get("item_name", "")).strip()
     divine = _as_bool(payload.get("divine", False))
     shiny = _as_bool(payload.get("shiny", False))
-    item_rarity = normalize_rarity(payload.get("item_rarity", "common"))
-    if divine and item_rarity == "common":
-        item_rarity = "divine"
+    item_rarity = resolve_event_rarity(payload.get("item_rarity"), divine)
 
     normalized_item_name, suffix_shiny = _strip_shiny_suffix(raw_item_name)
     if suffix_shiny and not shiny:
@@ -847,4 +854,19 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
         "Completed ingest "
         f"guild_id={guild_id} user_id={linked_user_id} reason={result.get('mode', '')} item={result.get('item', '')}"
     )
+    
+    # Log cost event for RealmShark ingest
+    try:
+        await log_background_cost_event(
+            guild_id,
+            operation_name=f"realmshark_ingest_{result.get('mode', 'unknown')}",
+            status="ok",
+            started_monotonic=started_monotonic,
+            started_unix=started_unix,
+            snapshot_before=snapshot_before,
+            source="realmshark_ingest",
+        )
+    except Exception as e:
+        _debug_log(f"Failed to log RealmShark ingest cost: {e}")
+    
     return result

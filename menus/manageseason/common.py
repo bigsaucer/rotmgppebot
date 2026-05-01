@@ -106,8 +106,10 @@ def _build_ppe_type_multiplier_lines(*, ppe_settings: dict | None = None) -> lis
             source_suffix = " (combo override)"
         elif source == "preset":
             source_suffix = " (default override)"
-        full_label = ppe_type_display_from_options(options, ppe_settings=settings, compact=False)
-        short_label = ppe_type_display_from_options(options, ppe_settings=settings, compact=True)
+        from utils.ppe_display import format_ppe_label_from_options
+
+        full_label = format_ppe_label_from_options(options, compact=False, guild_config={"ppe_settings": settings})
+        short_label = format_ppe_label_from_options(options, compact=True, guild_config={"ppe_settings": settings})
         lines.append(f"• {full_label} [{short_label}]: {value:.2f}x{source_suffix}")
     return lines
 
@@ -401,8 +403,8 @@ def build_manageseason_home_embed() -> discord.Embed:
     return embed
 
 
-def build_manage_bot_cost_embed(summary: dict[str, object]) -> discord.Embed:
-    """Build the bot-cost management embed for /manageseason."""
+def build_manage_bot_cost_embeds(summary: dict[str, object]) -> list[discord.Embed]:
+    """Build the bot-cost management embeds for /manageseason."""
     window_hours = int(summary.get("window_hours", 24) or 24)
     entry_count = int(summary.get("entry_count", 0) or 0)
     command_count = int(summary.get("command_count", 0) or 0)
@@ -417,10 +419,22 @@ def build_manage_bot_cost_embed(summary: dict[str, object]) -> discord.Embed:
     max_rss_after_mb = float(summary.get("max_rss_after_mb", 0.0) or 0.0)
     cost_rate = float(summary.get("cost_rate_per_gb_minute", 0.0) or 0.0)
     log_path = str(summary.get("log_path", "N/A") or "N/A")
+    
+    # Extract 30-day projection
+    projection = summary.get("projection_30day", {}) if isinstance(summary.get("projection_30day"), dict) else {}
+    daily_cost = float(projection.get("daily_cost_usd", 0.0) or 0.0)
+    cost_30day = float(projection.get("total_30day_cost_usd", 0.0) or 0.0)
+    
+    # Logging status will be added by the view when loading the summary
+    logging_enabled = summary.get("logging_enabled", True)
+    logging_status = "✅ Enabled" if logging_enabled else "❌ Disabled"
+
+    def _chunk_list(lst: list, chunk_size: int) -> list[list]:
+        return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
 
     top_by_cost = summary.get("top_by_cost", []) if isinstance(summary.get("top_by_cost", []), list) else []
     cost_lines: list[str] = []
-    for index, row in enumerate(top_by_cost[:5], start=1):
+    for index, row in enumerate(top_by_cost, start=1):
         if not isinstance(row, dict):
             continue
         command = str(row.get("command", "unknown"))
@@ -430,14 +444,14 @@ def build_manage_bot_cost_embed(summary: dict[str, object]) -> discord.Embed:
         cache_growth = int(row.get("total_cache_growth", 0) or 0)
         tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
         cost_lines.append(
-            f"{index}. {command} - ${command_cost:.6f} ({cost_share:.1f}%), calls={call_count}, cache+={cache_growth}, src={tracking_source}"
+            f"**{index}. {command}**\nAvg Call Cost: ${command_cost/max(call_count, 1):.6f} | Total: ${command_cost:.6f} ({cost_share:.1f}%), Calls: {call_count}, Cache+: {cache_growth}, Src: {tracking_source}"
         )
     if not cost_lines:
         cost_lines = ["No command cost records in this window yet."]
 
     top_by_rss = summary.get("top_by_rss_growth", []) if isinstance(summary.get("top_by_rss_growth", []), list) else []
     rss_lines: list[str] = []
-    for index, row in enumerate(top_by_rss[:5], start=1):
+    for index, row in enumerate(top_by_rss, start=1):
         if not isinstance(row, dict):
             continue
         command = str(row.get("command", "unknown"))
@@ -447,18 +461,14 @@ def build_manage_bot_cost_embed(summary: dict[str, object]) -> discord.Embed:
         command_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
         tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
         rss_lines.append(
-            f"{index}. {command} - rss+={rss_growth:.1f} MB ({rss_share:.1f}%), calls={call_count}, cost=${command_cost:.6f}, src={tracking_source}"
+            f"**{index}. {command}**\nTotal RSS+: {rss_growth:.1f} MB ({rss_share:.1f}%), Calls: {call_count}, Avg Call Time: {(float(row.get('total_duration_seconds',0.0))/max(call_count, 1)):.2f}s, Src: {tracking_source}"
         )
     if not rss_lines:
         rss_lines = ["No RSS growth records in this window yet."]
 
-    top_by_cache = (
-        summary.get("top_by_cache_growth", [])
-        if isinstance(summary.get("top_by_cache_growth", []), list)
-        else []
-    )
+    top_by_cache = summary.get("top_by_cache_growth", []) if isinstance(summary.get("top_by_cache_growth", []), list) else []
     cache_lines: list[str] = []
-    for index, row in enumerate(top_by_cache[:5], start=1):
+    for index, row in enumerate(top_by_cache, start=1):
         if not isinstance(row, dict):
             continue
         command = str(row.get("command", "unknown"))
@@ -468,58 +478,74 @@ def build_manage_bot_cost_embed(summary: dict[str, object]) -> discord.Embed:
         command_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
         tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
         cache_lines.append(
-            f"{index}. {command} - cache+={cache_growth} ({cache_share:.1f}%), calls={call_count}, cost=${command_cost:.6f}, src={tracking_source}"
+            f"**{index}. {command}**\nTotal Cache+: {cache_growth} ({cache_share:.1f}%), Calls: {call_count}, Cost: ${command_cost:.6f}, Src: {tracking_source}"
         )
     if not cache_lines:
         cache_lines = ["No cache growth records in this window yet."]
 
-    embed = discord.Embed(
-        title="Manage Bot Cost",
-        description=(
-            "Per-guild command telemetry to estimate memory spend, RSS growth, and cache growth by command.\n"
-            f"Viewing last **{window_hours}h**."
-        ),
-        color=discord.Color.orange(),
+    base_description = (
+        "Per-guild command telemetry to estimate memory spend, RSS growth, and cache growth by command.\n"
+        f"Viewing last **{window_hours}h**.\n\n"
+        "**Window Summary**\n"
+        f"Commands logged: **{entry_count}** across **{command_count}** command names\n"
+        f"Errors: **{error_count}**\n"
+        f"Total runtime: **{total_duration_seconds:.2f}s**\n"
+        f"Estimated usage: **{total_gb_minutes:.6f} GB-min**\n"
+        f"Estimated cost: **${total_cost:.6f}** (Projected 30d: **${cost_30day:.4f}** @ ${daily_cost:.4f}/day)\n"
+        f"Net RSS growth: **+{total_rss_growth:.1f} MB** | Net Cache+: **{total_cache_growth}**\n"
+        f"Peak RSS block: **{max_rss_after_mb:.1f} MB**\n"
+        f"Cost Logging: {logging_status}\n"
     )
-    embed.add_field(
-        name="Window Summary",
-        value=(
-            f"Commands logged: **{entry_count}** across **{command_count}** command names\n"
-            f"Errors: **{error_count}**\n"
-            f"Total runtime: **{total_duration_seconds:.2f}s**\n"
-            f"Estimated usage: **{total_gb_minutes:.6f} GB-min**\n"
-            f"Estimated cost: **${total_cost:.6f}**\n"
-            f"RSS growth total: **+{total_rss_growth:.1f} MB** / shrink total: **-{total_rss_shrink:.1f} MB**\n"
-            f"Cache growth total: **+{total_cache_growth}** / shrink total: **-{total_cache_shrink}**\n"
-            f"Peak RSS observed after command: **{max_rss_after_mb:.1f} MB**"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Top Cost Contributors",
-        value=_truncate_field_value("\n".join(cost_lines)),
-        inline=False,
-    )
-    embed.add_field(
-        name="Top RSS Growth Contributors",
-        value=_truncate_field_value("\n".join(rss_lines)),
-        inline=False,
-    )
-    embed.add_field(
-        name="Top Cache Growth Contributors",
-        value=_truncate_field_value("\n".join(cache_lines)),
-        inline=False,
-    )
-    embed.add_field(
-        name="Telemetry",
-        value=(
-            f"Cost rate: **${cost_rate:.6f} / GB-minute**\n"
-            f"Log file: `{log_path}`"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text="Use this panel to refresh windows, export summary/raw logs, or clear guild cost logs.")
-    return embed
+
+    embeds: list[discord.Embed] = []
+    
+    MAX_LINES_PER_PAGE = 7
+
+    # Cost pages
+    cost_chunks = _chunk_list(cost_lines, MAX_LINES_PER_PAGE)
+    for i, chunk in enumerate(cost_chunks):
+        embed = discord.Embed(
+            title="Manage Bot Cost (By Cost)",
+            description=base_description,
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name=f"Top Cost Contributors (Page {i+1}/{len(cost_chunks)})", value="\n\n".join(chunk), inline=False)
+        embeds.append(embed)
+
+    # RSS pages
+    rss_chunks = _chunk_list(rss_lines, MAX_LINES_PER_PAGE)
+    for i, chunk in enumerate(rss_chunks):
+        embed = discord.Embed(
+            title="Manage Bot Cost (By RSS Growth)",
+            description=base_description,
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name=f"Top RSS Growth Contributors (Page {i+1}/{len(rss_chunks)})", value="\n\n".join(chunk), inline=False)
+        embeds.append(embed)
+
+    # Cache pages
+    cache_chunks = _chunk_list(cache_lines, MAX_LINES_PER_PAGE)
+    for i, chunk in enumerate(cache_chunks):
+        embed = discord.Embed(
+            title="Manage Bot Cost (By Cache Growth)",
+            description=base_description,
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name=f"Top Cache Growth Contributors (Page {i+1}/{len(cache_chunks)})", value="\n\n".join(chunk), inline=False)
+        embeds.append(embed)
+
+    if not embeds:
+        embed = discord.Embed(
+            title="Manage Bot Cost",
+            description=base_description + "\n*No detailed telemetry records found.*",
+            color=discord.Color.orange(),
+        )
+        embeds.append(embed)
+
+    for i, embed in enumerate(embeds):
+        embed.set_footer(text=f"Page {i+1}/{len(embeds)} - Use ⬅️/➡️ to navigate")
+
+    return embeds
 
 
 def build_manage_contests_embed(settings: dict) -> discord.Embed:
@@ -583,6 +609,7 @@ def build_character_settings_home_embed(
     current_max_characters: int,
     ppe_types_enabled: bool,
     allowed_ppe_types: list[str],
+    menu_character_creation: bool,
 ) -> discord.Embed:
     """Build character settings embed for /manageseason character controls."""
     embed = discord.Embed(
@@ -595,6 +622,16 @@ def build_character_settings_home_embed(
         value=(
             f"Current max characters per player: **{current_max_characters}**\n"
             "If reduced, excess characters are removed starting from the lowest-point inactive characters."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Menu Character Creation",
+        value=(
+            f"Status: **{'Enabled' if menu_character_creation else 'Disabled'}**\n"
+            "When enabled, `/newppe` opens the character creation menu.\n"
+            "When disabled, `/newppe` creates a regular PPE immediately and still accepts `ppe_type` for explicitly allowed types.\n"
+            "Allowed PPE types still control what players can create with `ppe_type`."
         ),
         inline=False,
     )
@@ -831,6 +868,15 @@ def build_ppe_type_points_embed(character_settings: dict, *, types_page_index: i
         description="Configure how PPE type rules translate into final point multipliers and labels.",
         color=discord.Color.dark_teal(),
     )
+    if not bool(character_settings.get("menu_character_creation", True)):
+        embed.add_field(
+            name="⚠️ Menu Character Creation Is Off",
+            value=(
+                "Players will not see the creation menu in `/newppe`; they will get a regular PPE by default.\n"
+                "Only the server's currently allowed PPE types can be created with an explicit `ppe_type` argument."
+            ),
+            inline=False,
+        )
     page_suffix = f" (Page {page_index + 1}/{total_pages})" if total_pages > 1 else ""
     embed.add_field(name=f"Current PPE Types{page_suffix}", value="\n".join(lines), inline=False)
     embed.add_field(name="Iterative Base Multipliers", value="\n".join(iterative_base_lines), inline=False)

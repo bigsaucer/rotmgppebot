@@ -26,9 +26,11 @@ from utils.contest_leaderboards import normalize_contest_leaderboard_id
 DEFAULT_MAX_PPE_CHARACTERS = 10
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
+    "cost_logging_enabled": True,
     "ppe_settings": {
         "max_ppes": DEFAULT_MAX_PPE_CHARACTERS,
         "enable_ppe_types": True,
+        "menu_character_creation": True,
         "allowed_ppe_types": all_ppe_types(),
         "ppe_type_multipliers": normalize_ppe_type_multipliers({}),
         "iterative_base_multipliers": normalize_iterative_option_multipliers({}),
@@ -214,6 +216,7 @@ def _normalized_ppe_settings(config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "max_ppes": parsed_max,
         "enable_ppe_types": bool(settings.get("enable_ppe_types", True)),
+        "menu_character_creation": bool(settings.get("menu_character_creation", True)),
         "allowed_ppe_types": allowed_types,
         "ppe_type_multipliers": multipliers,
         "iterative_base_multipliers": iterative_base_multipliers,
@@ -333,6 +336,8 @@ def _normalized_realmshark_settings(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
     merged = dict(_DEFAULT_CONFIG)
+    # Preserve explicit top-level flags from raw config (e.g., cost logging)
+    merged["cost_logging_enabled"] = bool(raw.get("cost_logging_enabled", merged.get("cost_logging_enabled", True)))
     merged["ppe_settings"] = _normalized_ppe_settings(raw)
     merged["quest_settings"] = _normalized_targets(raw)
     merged["realmshark_settings"] = _normalized_realmshark_settings(raw)
@@ -892,3 +897,17 @@ async def update_class_points_modifiers(
 
     settings["class_overrides"] = class_overrides
     return await set_points_settings(interaction, settings)
+
+
+async def get_cost_logging_enabled(interaction: discord.Interaction) -> bool:
+    """Get whether bot cost logging is enabled for this guild."""
+    config = await load_guild_config(interaction)
+    return bool(config.get("cost_logging_enabled", True))
+
+
+async def set_cost_logging_enabled(interaction: discord.Interaction, enabled: bool) -> bool:
+    """Set whether bot cost logging is enabled for this guild."""
+    config = await load_guild_config(interaction)
+    config["cost_logging_enabled"] = bool(enabled)
+    saved = await save_guild_config(interaction, config)
+    return bool(saved.get("cost_logging_enabled", True))

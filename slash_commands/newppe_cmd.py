@@ -1,22 +1,24 @@
 
 
 import discord
+import logging
 from types import SimpleNamespace
 import traceback
 from uuid import uuid4
 
 from dataclass import PPEData, ROTMGClass
 from utils.ppe_types import (
+    DEFAULT_PPE_TYPE,
     build_ppe_type_options,
     get_ppe_type_multiplier_details_from_options,
     infer_legacy_ppe_type_from_options,
     is_duo_ppe_type,
     normalize_ppe_type_options,
-    ppe_type_compact_summary,
     ppe_type_label,
     ppe_type_option_signature,
     resolve_creation_ppe_type,
 )
+from utils.ppe_display import format_ppe_label_from_options
 from utils.penalty_embed import build_penalty_infographic_embed
 from utils.guild_config import get_max_ppes, load_guild_config, load_guild_config_by_id
 from utils.group_ppes import (
@@ -45,6 +47,8 @@ from utils.wizard_components import (
     get_minimum_rarity_options,
     requires_enforce_shiny_rarity_choice,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def create_new_ppe_for_user(
@@ -188,10 +192,11 @@ async def create_new_ppe_for_user(
         "class_name": class_enum.value,
         "ppe_type": new_ppe.ppe_type,
         "ppe_type_label": ppe_type_label(new_ppe.ppe_type),
-        "ppe_type_summary": ppe_type_compact_summary(
+        "ppe_type_summary": format_ppe_label_from_options(
             new_ppe.ppe_type_options,
+            compact=True,
+            guild_config={"ppe_settings": ppe_settings},
             fallback_type=new_ppe.ppe_type,
-            ppe_settings=ppe_settings,
         ),
         "ppe_count": ppe_count + 1,
         "max_ppes": max_ppes,
@@ -369,7 +374,7 @@ async def _find_unbound_legacy_duo_ppes_for_user(
             {
                 "ppe_id": int(getattr(ppe, "id", 0) or 0),
                 "class_name": str(getattr(getattr(ppe, "name", "?"), "value", getattr(ppe, "name", "?"))),
-                "type_summary": ppe_type_compact_summary(options, fallback_type=getattr(ppe, "ppe_type", None)),
+                "type_summary": format_ppe_label_from_options(options, compact=True, fallback_type=getattr(ppe, "ppe_type", None)),
             }
         )
 
@@ -493,6 +498,7 @@ async def send_duo_handshake_invite(
         dm_sent = True
     except discord.HTTPException:
         dm_sent = False
+        logger.info("Failed to DM user %s for duo invite in guild %s (user may have DMs closed)", partner_user_id, interaction.guild.id if interaction.guild is not None else None)
 
     return request_token, dm_sent
 
@@ -854,11 +860,12 @@ class DuoSetupInviteView(discord.ui.View):
                 view=launcher_view,
             )
         except Exception as exc:
-            print(
-                f"[DUO_DM][ERROR] accept failed guild_id={self.guild_id} requester={self.requester_user_id} "
-                f"partner={self.partner_user_id}: {exc}"
+            logger.exception(
+                "[DUO_DM][ERROR] accept failed guild_id=%s requester=%s partner=%s",
+                self.guild_id,
+                self.requester_user_id,
+                self.partner_user_id,
             )
-            print(traceback.format_exc())
             if not interaction.response.is_done():
                 await interaction.response.send_message(
                     "Could not process this duo invite. Please try again or ask for a new invite.",
@@ -912,11 +919,12 @@ class DuoSetupInviteView(discord.ui.View):
                 ),
             )
         except Exception as exc:
-            print(
-                f"[DUO_DM][ERROR] reject failed guild_id={self.guild_id} requester={self.requester_user_id} "
-                f"partner={self.partner_user_id}: {exc}"
+            logger.exception(
+                "[DUO_DM][ERROR] reject failed guild_id=%s requester=%s partner=%s",
+                self.guild_id,
+                self.requester_user_id,
+                self.partner_user_id,
             )
-            print(traceback.format_exc())
             if not interaction.response.is_done():
                 await interaction.response.send_message(
                     "Could not process this duo invite. Please try again or ask for a new invite.",
@@ -1275,9 +1283,11 @@ async def command(
     if not interaction.guild:
         return await interaction.response.send_message("❌ This command can only be used in a server.")
 
-    if ppe_type is None:
-        guild_config = await load_guild_config(interaction)
-        ppe_settings = guild_config.get("ppe_settings", {}) if isinstance(guild_config.get("ppe_settings", {}), dict) else {}
+    guild_config = await load_guild_config(interaction)
+    ppe_settings = guild_config.get("ppe_settings", {}) if isinstance(guild_config.get("ppe_settings", {}), dict) else {}
+    menu_character_creation_enabled = bool(ppe_settings.get("menu_character_creation", True))
+
+    if ppe_type is None and menu_character_creation_enabled:
         wizard = NewPpeIterativeWizardView(
             owner_id=interaction.user.id,
             class_name=class_name,
@@ -1295,8 +1305,9 @@ async def command(
         wizard.message = await interaction.original_response()
         return
 
-    guild_config = await load_guild_config(interaction)
-    ppe_settings = guild_config.get("ppe_settings", {}) if isinstance(guild_config.get("ppe_settings", {}), dict) else {}
+    if ppe_type is None:
+        ppe_type = DEFAULT_PPE_TYPE
+
     resolved_type, type_error = resolve_creation_ppe_type(
         ppe_type,
         enabled=bool(ppe_settings.get("enable_ppe_types", True)),
@@ -1329,6 +1340,8 @@ async def command(
             ppe_type=resolved_type,
         )
     except ValueError as exc:
+        logger.warning("create_new_ppe_for_user failed for user=%s in guild=%s: %s", interaction.user.id if interaction.user else None, interaction.guild.id if interaction.guild else None, exc)
+        logger.debug("Traceback for create_new_ppe_for_user:", exc_info=True)
         return await interaction.response.send_message(str(exc), ephemeral=True)
 
     loot_adjustment_lines = "\n".join(loot_adjustment_detail_lines(result["loot_adjustments"]))
@@ -1400,6 +1413,8 @@ class DuoPpeTypePartnerModal(discord.ui.Modal, title="Set Duo Partner Discord ID
                 context=request_context,
             )
         except ValueError as exc:
+            logger.warning("send_duo_handshake_invite failed for requester=%s partner=%s guild=%s: %s", interaction.user.id if interaction.user else None, partner_id, interaction.guild.id if interaction.guild else None, exc)
+            logger.debug("Traceback for send_duo_handshake_invite:", exc_info=True)
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
         wizard = NewPpeIterativeWizardView(
@@ -1478,6 +1493,8 @@ class DuoPartnerIdModal(discord.ui.Modal, title="Set Duo Partner Discord ID"):
                 context=request_context,
             )
         except ValueError as exc:
+            logger.warning("send_duo_handshake_invite failed for requester=%s partner=%s guild=%s: %s", interaction.user.id if interaction.user else None, partner_id, interaction.guild.id if interaction.guild else None, exc)
+            logger.debug("Traceback for send_duo_handshake_invite:", exc_info=True)
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
@@ -1648,9 +1665,21 @@ class NewPpeIterativeWizardView(discord.ui.View):
             if options.get("duo_enabled"):
                 partner_id = options.get("duo_partner_id")
                 partner_line = f"<@{partner_id}>" if partner_id else "Missing"
+            try:
+                selected_label = format_ppe_label_from_options(
+                    options, compact=True, guild_config={"ppe_settings": self.ppe_settings}
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to format PPE label in wizard summary for guild=%s user=%s",
+                    getattr(self, "guild_id", None),
+                    getattr(self, "owner_id", None),
+                )
+                selected_label = f"(Signature: {breakdown.get('signature', ppe_type_option_signature(options))})"
+
             summary_lines = [
                 f"Review new PPE setup for {self.class_name}.",
-                f"Selected: {ppe_type_compact_summary(options, ppe_settings=self.ppe_settings)}",
+                f"Selected: {selected_label}",
                 f"Signature: `{breakdown.get('signature', ppe_type_option_signature(options))}`",
                 f"Duo Partner: {partner_line}",
                 "",
@@ -1918,6 +1947,8 @@ class _WizardCreatePpeButton(discord.ui.Button):
                 guild_override=view.guild_override,
             )
         except ValueError as exc:
+            logger.warning("create_new_ppe_for_user (wizard) failed for user=%s guild=%s: %s", interaction.user.id if interaction.user else None, interaction.guild.id if interaction.guild else None, exc)
+            logger.debug("Traceback for create_new_ppe_for_user (wizard):", exc_info=True)
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
