@@ -77,7 +77,7 @@ SERVER1_ID = 381297367036592128 # Last Oasis
 SERVER2_ID =  # Test Server
 SERVER3_ID =  # My Testing Server
 
-guilds = [discord.Object(id=SERVER1_ID), discord.Object(id=SERVER2_ID), discord.Object(id=SERVER3_ID)]
+guilds = [discord.Object(id=SERVER1_ID)]
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
